@@ -1,0 +1,240 @@
+name: 'Vale prose lint'
+description: >-
+  Runs Vale on the prose a pull request changed, posts one pinned comment, and
+  sets a check. Ships no rules of its own — it takes them from the repository
+  it runs in.
+author: 'elecnix'
+
+branding:
+  icon: 'check-square'
+  color: 'purple'
+
+inputs:
+  config:
+    description: >-
+      Path to the .vale.ini to use. Leave empty to let Vale find it by walking
+      up from the linted files, which is the normal case.
+    required: false
+    default: ''
+  sync:
+    description: >-
+      Run `vale sync` before linting, to fetch the packages a `Packages =` line
+      pins. Set false when the repository commits its styles.
+    required: false
+    default: 'true'
+  styles:
+    description: >-
+      An extra styles directory to add on top of the resolved StylesPath, for
+      rules that live outside the pinned pack. Its contents are copied in, so a
+      rule here overrides one of the same name from a package.
+    required: false
+    default: ''
+  files:
+    description: >-
+      What to lint, space or newline separated. Leave empty to lint the
+      markdown this pull request changed.
+    required: false
+    default: ''
+  fail-on:
+    description: 'Alert level that fails the check: suggestion, warning, or error.'
+    required: false
+    default: 'error'
+  comment:
+    description: 'Post the pinned pull-request comment. The check is set either way.'
+    required: false
+    default: 'true'
+  check:
+    description: 'Create the `vale` check run.'
+    required: false
+    default: 'true'
+  vale-version:
+    description: >-
+      The Vale release to install. Pin it to whatever the contributors run
+      locally: a version gap between the runner and a laptop is how this gate
+      starts disagreeing with itself.
+    required: false
+    default: '3.20.0'
+  token:
+    description: >-
+      Token used to read the changed files and decorate the pull request. Needs
+      pull-requests: write to comment and checks: write to set the check.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  vale-version:
+    description: 'The Vale version that produced the verdict.'
+    value: ${{ steps.install.outputs.version }}
+  outcome:
+    description: 'success, failure, or error (the linter could not run).'
+    value: ${{ steps.report.outputs.outcome }}
+  alerts:
+    description: 'Total alerts Vale reported, at every level.'
+    value: ${{ steps.report.outputs.alerts }}
+
+runs:
+  using: 'composite'
+  steps:
+    # No third-party action is used anywhere in this composite, deliberately.
+    # A prose linter is not worth widening a caller's supply chain.
+    - name: Install Vale
+      id: install
+      shell: bash
+      env:
+        VALE_VERSION: ${{ inputs.vale-version }}
+      run: |
+        set -euo pipefail
+        case "$(uname -s)/$(uname -m)" in
+          Linux/x86_64)          asset="Linux_64-bit.tar.gz" ;;
+          Linux/aarch64|Linux/arm64) asset="Linux_arm64.tar.gz" ;;
+          Darwin/x86_64)         asset="macOS_64-bit.tar.gz" ;;
+          Darwin/arm64)          asset="macOS_arm64.tar.gz" ;;
+          *) echo "::error::vale-action has no Vale build for $(uname -s)/$(uname -m)."; exit 2 ;;
+        esac
+
+        dir="${RUNNER_TEMP:-/tmp}/vale-action-bin"
+        mkdir -p "$dir"
+        base="https://github.com/errata-ai/vale/releases/download/v${VALE_VERSION}"
+        name="vale_${VALE_VERSION}_${asset}"
+
+        curl -sSfL --retry 3 -o "$dir/$name" "$base/$name"
+        curl -sSfL --retry 3 -o "$dir/checksums.txt" "$base/vale_${VALE_VERSION}_checksums.txt"
+
+        # Verify before unpacking. A tampered or truncated download must not
+        # become a green check.
+        ( cd "$dir" && grep " $name\$" checksums.txt > want.txt \
+          && { command -v sha256sum >/dev/null && sha256sum -c want.txt || shasum -a 256 -c want.txt; } )
+
+        tar -xzf "$dir/$name" -C "$dir" vale
+        echo "$dir" >> "$GITHUB_PATH"
+        version="$("$dir/vale" --version | awk '{print $NF}')"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+        echo "Vale $version"
+
+    - name: Work out what to lint
+      id: files
+      shell: bash
+      env:
+        FILES: ${{ inputs.files }}
+        ACTION_DIR: ${{ github.action_path }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        list="${RUNNER_TEMP:-/tmp}/vale-files.txt"
+        : > "$list"
+
+        if [ -n "${FILES// /}" ]; then
+          printf '%s\n' $FILES > "$list"
+        elif [ -n "$PR" ] && [ -n "$GH_TOKEN" ]; then
+          python3 "$ACTION_DIR/scripts/vale_action.py" resolve-files \
+            --repo "$REPO" --pr "$PR" --token "$GH_TOKEN" > "$list"
+        else
+          # Not a pull request and nothing named: walk the tree. --glob is a
+          # directory-walk filter, so it works here and only here — pass it
+          # alongside an explicit file path and Vale reports a clean run.
+          echo "::notice::No pull request and no files input; linting the whole tree."
+          echo "." > "$list"
+          echo "glob=--glob=*.{md,markdown,mdx}" >> "$GITHUB_OUTPUT"
+        fi
+
+        count="$(grep -cve '^$' "$list" || true)"
+        echo "list=$list" >> "$GITHUB_OUTPUT"
+        echo "count=$count" >> "$GITHUB_OUTPUT"
+        echo "Linting $count path(s)."
+
+    - name: Sync Vale packages
+      if: inputs.sync == 'true' && steps.files.outputs.count != '0'
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+      run: |
+        set -euo pipefail
+        vale --no-global ${CONFIG:+--config="$CONFIG"} sync
+
+    - name: Add the extra styles
+      if: inputs.styles != '' && steps.files.outputs.count != '0'
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        EXTRA: ${{ inputs.styles }}
+      run: |
+        set -euo pipefail
+        if [ ! -d "$EXTRA" ]; then
+          echo "::error::styles input points at $EXTRA, which is not a directory."
+          exit 2
+        fi
+        # Ask Vale where its StylesPath resolved to rather than re-parsing the
+        # ini here; two parsers disagree the first time either one changes.
+        target="$(vale --no-global ${CONFIG:+--config="$CONFIG"} ls-config \
+          | python3 -c 'import json,sys; p=json.load(sys.stdin).get("Paths") or []; print(p[0] if p else "")')"
+        if [ -z "$target" ]; then
+          echo "::error::Vale resolved no StylesPath, so there is nowhere to add $EXTRA."
+          exit 2
+        fi
+        mkdir -p "$target"
+        cp -R "$EXTRA"/. "$target"/
+        echo "Copied $EXTRA into $target."
+
+    - name: Run Vale
+      id: vale
+      shell: bash
+      env:
+        CONFIG: ${{ inputs.config }}
+        LIST: ${{ steps.files.outputs.list }}
+        GLOB: ${{ steps.files.outputs.glob }}
+        COUNT: ${{ steps.files.outputs.count }}
+      run: |
+        set -uo pipefail
+        out="${RUNNER_TEMP:-/tmp}/vale-out.json"
+        err="${RUNNER_TEMP:-/tmp}/vale-err.txt"
+        : > "$out"; : > "$err"
+
+        if [ "$COUNT" = "0" ]; then
+          echo "::notice::No prose changed; Vale had nothing to lint."
+          echo '{}' > "$out"
+          echo "status=0" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # --no-global always. Without it a developer's own ~/.vale.ini can
+        # change the verdict, and a gate that reads a different rule set per
+        # machine is not a gate.
+        set +e
+        # shellcheck disable=SC2046
+        vale --no-global --output=JSON ${CONFIG:+--config="$CONFIG"} ${GLOB:+"$GLOB"} \
+          $(grep -ve '^$' "$LIST" | tr '\n' ' ') > "$out" 2> "$err"
+        status=$?
+        set -e
+        # Vale exits 1 when it finds alerts. That is a verdict, not a failure,
+        # so the status is recorded and judged in the report step.
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        echo "out=$out" >> "$GITHUB_OUTPUT"
+        echo "err=$err" >> "$GITHUB_OUTPUT"
+        cat "$err" >&2 || true
+
+    - name: Report
+      id: report
+      shell: bash
+      env:
+        ACTION_DIR: ${{ github.action_path }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        python3 "$ACTION_DIR/scripts/vale_action.py" report \
+          --stdout "${RUNNER_TEMP:-/tmp}/vale-out.json" \
+          --stderr "${RUNNER_TEMP:-/tmp}/vale-err.txt" \
+          --status "${{ steps.vale.outputs.status }}" \
+          --fail-on "${{ inputs.fail-on }}" \
+          --version "${{ steps.install.outputs.version }}" \
+          --files "${{ steps.files.outputs.count }}" \
+          --repo "$REPO" \
+          ${PR:+--pr "$PR"} \
+          --sha "$SHA" \
+          --token "$GH_TOKEN" \
+          --comment "${{ inputs.comment }}" \
+          --check "${{ inputs.check }}"

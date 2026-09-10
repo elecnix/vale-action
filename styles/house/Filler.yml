@@ -1,0 +1,11 @@
+extends: existence
+message: "Cut '%s'. It costs the reader time and adds nothing."
+level: warning
+ignorecase: true
+tokens:
+  - basically
+  - essentially
+  - simply
+  - actually
+  - very
+  - really

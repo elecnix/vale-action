@@ -1,0 +1,7 @@
+extends: existence
+message: "Drop the hedge '%s'. State the fact."
+level: error
+ignorecase: true
+tokens:
+  - quite
+  - somewhat

@@ -1,0 +1,23 @@
+name: dupdelta
+
+# Reports only the duplication this change introduces, not what the repository
+# already carried. It warns; it never fails the build.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: dupdelta-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dupdelta:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # the merge-base has to be reachable
+      - uses: elecnix/dupdelta@v0.2.0

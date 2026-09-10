@@ -1,0 +1,140 @@
+name: ci
+
+# Three things are proved here on every change: the verdict logic in unit
+# tests, the composite action end to end against the fixture repositories, and
+# that no name which must stay private reached this repository.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scrub:
+    name: no private names
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # the author-address check reads the whole history
+      - run: ./scripts/scrub.sh .
+
+  unit:
+    name: verdict logic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+      - run: python3 scripts/test_vale_action.py
+
+  fixture-clean:
+    name: clean prose passes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - id: vale
+        uses: ./
+        with:
+          config: fixtures/clean/.vale.ini
+          files: fixtures/clean/docs
+          sync: false
+          comment: false
+          check: false
+      - name: The verdict is a pass
+        run: |
+          set -euo pipefail
+          test "${{ steps.vale.outputs.outcome }}" = "success"
+          test "${{ steps.vale.outputs.alerts }}" = "0"
+          test -n "${{ steps.vale.outputs.vale-version }}"
+
+  fixture-dirty:
+    name: bad prose fails
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - id: vale
+        continue-on-error: true
+        uses: ./
+        with:
+          config: fixtures/dirty/.vale.ini
+          files: fixtures/dirty/docs
+          sync: false
+          comment: false
+          check: false
+      - name: The step went red and the verdict says why
+        run: |
+          set -euo pipefail
+          test "${{ steps.vale.outcome }}" = "failure"
+          test "${{ steps.vale.outputs.outcome }}" = "failure"
+          test "${{ steps.vale.outputs.alerts }}" != "0"
+
+  fixture-dirty-tolerated:
+    name: bad prose passes under a higher fail-on
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The same alerts, demoted below the bar. This pins `fail-on` as the
+      # only thing separating this run from the red one above.
+      - id: vale
+        uses: ./
+        with:
+          config: fixtures/tolerated/.vale.ini
+          files: fixtures/dirty/docs
+          sync: false
+          comment: false
+          check: false
+      - name: The verdict is a pass with alerts reported
+        run: |
+          set -euo pipefail
+          test "${{ steps.vale.outputs.outcome }}" = "success"
+          test "${{ steps.vale.outputs.alerts }}" != "0"
+
+  fixture-broken:
+    name: a linter that could not run does not pass
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - id: vale
+        continue-on-error: true
+        uses: ./
+        with:
+          config: fixtures/broken/.vale.ini
+          files: fixtures/broken/docs
+          sync: false
+          comment: false
+          check: false
+      - name: The step went red and says the linter could not run
+        run: |
+          set -euo pipefail
+          test "${{ steps.vale.outcome }}" = "failure"
+          test "${{ steps.vale.outputs.outcome }}" = "error"
+
+  fixture-styles-input:
+    name: an extra styles directory is added
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The clean fixture's prose is clean only against the clean fixture's
+      # rules. Inject one more rule and it has to go red.
+      - id: vale
+        continue-on-error: true
+        uses: ./
+        with:
+          config: fixtures/clean/.vale.ini
+          files: fixtures/clean/docs
+          styles: fixtures/extra-styles
+          sync: false
+          comment: false
+          check: false
+      - name: The injected rule fired
+        run: |
+          set -euo pipefail
+          test "${{ steps.vale.outputs.outcome }}" = "failure"

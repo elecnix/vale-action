@@ -1,0 +1,12 @@
+# Vale fetches packages here. They are pinned by .vale.ini and never committed.
+styles/config/
+styles/Google/
+styles/Microsoft/
+styles/write-good/
+styles/proselint/
+styles/alex/
+styles/Joblint/
+styles/Readability/
+styles/RedHat/
+__pycache__/
+*.pyc

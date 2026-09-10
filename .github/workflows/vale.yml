@@ -1,0 +1,27 @@
+name: prose
+
+# The action linting its own repository — the live proof it works when a caller
+# consumes it, and the only place the pinned comment and the check run are
+# exercised for real. The rules it reads are this repository's own .vale.ini.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  group: prose-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  vale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./
+        with:
+          sync: false     # this repository commits the one style it uses
+          fail-on: error  # advisory for now: the house rules are warnings
