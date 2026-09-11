@@ -128,6 +128,19 @@ in one file fail to load.
 **Deleted files are dropped.** Vale reports a missing path as a failed run, so a
 pull request that only removes prose stays green.
 
+## Running it locally
+
+The point of the no-rules design is that this reproduces the check exactly:
+
+```sh
+brew install vale          # or see https://vale.sh/docs/install
+vale sync                  # only when your .vale.ini pins packages
+vale --no-global $(git diff --name-only origin/main... -- '*.md')
+```
+
+`--no-global` matters as much on a laptop as on a runner. Drop it and your own
+`~/.vale.ini` joins the rule set, and the answer stops matching CI.
+
 ## Fixtures
 
 `fixtures/` holds three small repositories that CI runs the action against on
