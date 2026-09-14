@@ -5,7 +5,7 @@ The action's shell layer installs Vale, works out what to lint, and runs it.
 This module owns everything after that: which alerts count, what the pinned
 comment says, what the check run concludes, and what the process exits with.
 
-Three decisions live here and nowhere else.
+The decisions below are made here and nowhere else.
 
 **A linter that could not run has not passed.** Vale exits 1 when it finds
 alerts, which is a normal verdict, and 2 or more when it failed. It also fails
@@ -16,6 +16,13 @@ that says the linter could not run, never as a pass.
 **The comment is pinned, not appended.** Every run looks for the marker below
 in the pull request's existing comments and edits that one in place. A second
 comment is never posted, however many times the workflow runs.
+
+**The newest head run decides what the pinned comment says.** GitHub replays the
+original event on a re-run, so a re-run of a superseded commit lints code the
+pull request has already moved past. Writing its verdict would replace the one a
+newer run posted, and it would set a check on a sha nobody is reviewing. A run
+whose sha is not the live head, read from the API rather than from the event it
+was queued with, writes to the job summary and nothing else.
 
 **A missing write scope degrades, it does not crash.** A caller who grants only
 `contents: read` still gets the verdict as an exit code and a job summary; the
@@ -101,6 +108,48 @@ def next_link(header: str) -> str | None:
     for part in header.split(","):
         if 'rel="next"' in part and "<" in part:
             return part[part.index("<") + 1 : part.index(">")]
+    return None
+
+
+def pull_head(payload: object) -> str | None:
+    """The head commit out of a pull request payload, when there is one."""
+    if not isinstance(payload, dict):
+        return None
+    head = payload.get("head")
+    if not isinstance(head, dict):
+        return None
+    sha = head.get("sha")
+    return sha if isinstance(sha, str) and sha else None
+
+
+def superseded(sha: str | None, head: str | None) -> bool:
+    """Is this run linting a commit the pull request has moved past?
+
+    An unknown head answers no. A read that failed is not evidence that this run
+    is out of date, and the head run still has to post its verdict."""
+    return bool(sha and head and sha != head)
+
+
+def head_of(repo: str, pr: int | None, token: str | None) -> str | None:
+    """The pull request's live head commit, or None when it cannot be read.
+
+    The live read is the point. GitHub replays the original event on a re-run,
+    so `github.event.pull_request.head.sha` names the commit that run checks
+    out, which may no longer be the one under review."""
+    if not (pr and repo and token):
+        return None
+    try:
+        return pull_head(api("GET", f"/repos/{repo}/pulls/{pr}", token))
+    except urllib.error.HTTPError as exc:
+        warn(
+            f"Could not read pull request #{pr} (HTTP {exc.code}); "
+            "treating this run as the head."
+        )
+    except urllib.error.URLError as exc:
+        warn(
+            f"Could not read pull request #{pr} ({exc.reason}); "
+            "treating this run as the head."
+        )
     return None
 
 
@@ -289,6 +338,11 @@ def plural(count: int, noun: str) -> str:
     return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
+def short(sha: str | None) -> str:
+    """Seven characters, which is what GitHub itself shows."""
+    return (sha or "")[:7]
+
+
 # --------------------------------------------------------------------------
 # Decorating the pull request
 # --------------------------------------------------------------------------
@@ -353,6 +407,11 @@ def emit_output(name: str, value: str) -> None:
 def cmd_report(args: argparse.Namespace) -> int:
     stderr_text = read(args.stderr)
 
+    # Whose verdict this is. A re-run replays the commit from its original
+    # event, so what the pull request points at now has to be read rather than
+    # assumed from the payload this run was queued with.
+    head = head_of(args.repo, args.pr, args.token)
+
     # The linter's own failure is the first thing to rule out, and the only
     # outcome that must never read as a pass.
     stdout_text = read(args.stdout)
@@ -370,7 +429,9 @@ def cmd_report(args: argparse.Namespace) -> int:
         broken = f"{exc}\n{describe_failure(stderr_text)}".strip()
 
     if broken:
-        decorate(args, failure_body(broken, args.version), "failure", "Vale could not run")
+        decorate(
+            args, failure_body(broken, args.version), "failure", "Vale could not run", head
+        )
         print(f"::error::Vale could not run. {broken.splitlines()[0][:200]}", file=sys.stderr)
         emit_output("outcome", "error")
         return 2
@@ -384,13 +445,36 @@ def cmd_report(args: argparse.Namespace) -> int:
         if failed
         else f"Clean — {plural(args.files, 'file')} linted"
     )
-    decorate(args, body, conclusion, title)
+    decorate(args, body, conclusion, title, head)
     emit_output("outcome", "failure" if failed else "success")
     emit_output("alerts", str(sum(tally.values())))
     return 1 if failed else 0
 
 
-def decorate(args: argparse.Namespace, body: str, conclusion: str, title: str) -> None:
+def decorate(
+    args: argparse.Namespace,
+    body: str,
+    conclusion: str,
+    title: str,
+    head: str | None = None,
+) -> None:
+    """Write the verdict where a reader sees it: the job summary first, then the
+    pinned comment and the check run.
+
+    `head` is the pull request's head commit as read live. A run whose sha is
+    not that commit gets the job summary alone: the comment is shared by every
+    run of every sha, so an outdated run writing it would replace the verdict a
+    newer run posted, and its check run would set a status on a commit nobody
+    is reviewing."""
+    if superseded(args.sha, head):
+        outdated = (
+            f"This run linted {short(args.sha)}, which is no longer the head of "
+            f"#{args.pr} ({short(head)}). Its verdict is below, but the pinned "
+            "comment and the check run were left to the newest run."
+        )
+        summarize(f"> {outdated}\n\n{body}")
+        print(f"::notice::{outdated}")
+        return
     summarize(body)
     if not args.token or not args.repo:
         return
@@ -436,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
     report.add_argument("--files", type=int, default=0, help="how many files were linted")
     report.add_argument("--repo", default=None)
     report.add_argument("--pr", type=int, default=None)
-    report.add_argument("--sha", default=None)
+    report.add_argument("--sha", default=None, help="the commit this run checked out")
     report.add_argument("--token", default=None)
     report.add_argument("--comment", type=boolean, default=True)
     report.add_argument("--check", type=boolean, default=True)

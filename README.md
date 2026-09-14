@@ -83,6 +83,12 @@ and rewrites it. A push never adds a second one.
 **A check named `vale`.** Green when nothing reached `fail-on`, red when
 something did, and red with the words *could not run* when Vale itself failed.
 
+**A re-run writes to the job summary alone.** GitHub replays the original event
+when a run is re-run, so the replayed job lints the commit it was queued with,
+which may be one the pull request has moved past. That job puts its verdict in
+the step summary and leaves the pinned comment and the check run to the newest
+run, so a check on a sha nobody is reviewing cannot contradict the head.
+
 **`--no-global`, always.** Without it a personal `~/.vale.ini` on the machine
 changes the verdict, and a gate that reads a different rule set per machine is
 not a gate.
