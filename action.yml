@@ -214,6 +214,9 @@ runs:
         echo "err=$err" >> "$GITHUB_OUTPUT"
         cat "$err" >&2 || true
 
+    # The run's sha is the commit it checked out, which on a re-run is not what
+    # the pull request points at any more. The report step reads the live head
+    # and skips the comment and the check when the two differ.
     - name: Report
       id: report
       shell: bash
