@@ -1,0 +1,10 @@
+diff --git a/fixtures/dirty/docs/limits.md b/fixtures/dirty/docs/limits.md
+index 1111111..2222222 100644
+--- a/fixtures/dirty/docs/limits.md
++++ b/fixtures/dirty/docs/limits.md
+@@ -3,3 +3,5 @@
+ It basically refuses a header past one kilobyte.
+ 
+ A retry waits really patiently before it gives up.
++
++A header with a very long name is what the parser refuses.

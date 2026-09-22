@@ -102,82 +102,138 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      # The control. Read whole, the fixture carries six alerts across two
-      # files, and this run says six. It also leaves `vale` on PATH for the
-      # steps below, which is what installing it inside the action is for.
-      - id: whole
-        continue-on-error: true
+      # One run of the action, on the clean fixture, to put `vale` on PATH for
+      # the steps below — and to keep every step in this job one that is
+      # expected to succeed. A step meant to fail leaves a failure annotation
+      # on the check run, and an annotation reading `exit code 1` is
+      # indistinguishable from a broken job to everything downstream of it. So
+      # each case below asserts its own verdict inside the step that produced
+      # it rather than letting the step go red on purpose.
+      - id: install
         uses: ./
         with:
-          config: fixtures/dirty/.vale.ini
-          files: fixtures/dirty/docs
+          config: fixtures/clean/.vale.ini
+          files: fixtures/clean/docs
           sync: false
           comment: false
           check: false
+
+      # The baseline the narrowing starts from. Read whole, the dirty fixture
+      # carries six alerts across its two files. Vale exits 1 when it finds
+      # them, so the call is allowed to fail: the count is the assertion.
       - name: Every line of every file linted
-        run: test "${{ steps.whole.outputs.alerts }}" = "6"
+        run: |
+          set -euo pipefail
+          vale --no-global --config=fixtures/dirty/.vale.ini --output=JSON \
+            fixtures/dirty/docs/guide.md fixtures/dirty/docs/limits.md \
+            > "$RUNNER_TEMP/whole.json" || true
+          total="$(python3 -c 'import json, sys; print(sum(len(a) for a in json.load(open(sys.argv[1])).values()))' \
+            "$RUNNER_TEMP/whole.json")"
+          test "$total" = "6"
+          echo "The fixture carries $total alerts when its files are read whole."
 
       # A fixture pull request that touches one line of a file which is already
       # red. The alerts it inherited are counted, named, and left out of the
       # verdict, which is the whole point: a gate that goes red over debt the
-      # change did not write is a gate people route around.
+      # change did not write is a gate people route around. Vale exits 1 here,
+      # because the file does carry alerts; the verdict is about the line this
+      # change wrote.
       - name: A pull request whose line the rules say nothing about
-        id: clean-edit
-        continue-on-error: true
         run: |
           set -euo pipefail
           python3 scripts/vale_action.py resolve-files \
             --files-json fixtures/dirty/files-touching-a-clean-line.json \
             --lines-out "$RUNNER_TEMP/lines.json" > "$RUNNER_TEMP/list.txt"
+          set +e
           vale --no-global --config=fixtures/dirty/.vale.ini --output=JSON \
-            "$(cat "$RUNNER_TEMP/list.txt")" > "$RUNNER_TEMP/raw.json" || status=$?
+            "$(cat "$RUNNER_TEMP/list.txt")" > "$RUNNER_TEMP/raw.json"
+          status=$?
+          set -e
+          set +e
           python3 scripts/vale_action.py report \
             --stdout "$RUNNER_TEMP/raw.json" \
-            --status "${status:-0}" \
+            --status "$status" \
             --fail-on error \
-            --version "${{ steps.whole.outputs.vale-version }}" \
+            --version "${{ steps.install.outputs.vale-version }}" \
             --files 1 \
             --changed-lines "$RUNNER_TEMP/lines.json" \
             --comment false \
             --check false
-      - name: The check passes and the inherited alerts are named
-        run: |
-          set -euo pipefail
-          test "${{ steps.clean-edit.outcome }}" = "success"
-          test "${{ steps.clean-edit.outputs.alerts }}" = "0"
-          test "${{ steps.clean-edit.outputs.ignored }}" = "3"
-          # The wording of that naming is pinned by the unit tests, which can
-          # read the body the report wrote; a step summary belongs to the step
-          # that wrote it and is not readable from the next one.
+          verdict=$?
+          set -e
+          test "$verdict" = "0"
+          # The wording and the count the reader sees, read back from the step
+          # summary this very step wrote.
+          grep -q "Nothing on the lines this change writes" "$GITHUB_STEP_SUMMARY"
+          grep -q "3 further alerts on untouched lines are left out" "$GITHUB_STEP_SUMMARY"
 
-      # And the same shape the other way: the line this fixture pull request
-      # writes is one the rules object to. Narrowing must not become a way for
-      # a new alert to reach main unremarked.
+      # The same shape the other way: the line this fixture pull request writes
+      # is one the rules object to. Narrowing must not become a way for a new
+      # alert to reach main unremarked.
       - name: A pull request whose line the rules object to
-        id: alert-edit
-        continue-on-error: true
         run: |
           set -euo pipefail
           python3 scripts/vale_action.py resolve-files \
             --files-json fixtures/dirty/files-touching-an-alert.json \
             --lines-out "$RUNNER_TEMP/lines.json" > "$RUNNER_TEMP/list.txt"
+          set +e
           vale --no-global --config=fixtures/dirty/.vale.ini --output=JSON \
-            "$(cat "$RUNNER_TEMP/list.txt")" > "$RUNNER_TEMP/raw.json" || status=$?
+            "$(cat "$RUNNER_TEMP/list.txt")" > "$RUNNER_TEMP/raw.json"
+          status=$?
+          set -e
+          set +e
           python3 scripts/vale_action.py report \
             --stdout "$RUNNER_TEMP/raw.json" \
-            --status "${status:-0}" \
+            --status "$status" \
             --fail-on error \
-            --version "${{ steps.whole.outputs.vale-version }}" \
+            --version "${{ steps.install.outputs.vale-version }}" \
             --files 1 \
             --changed-lines "$RUNNER_TEMP/lines.json" \
             --comment false \
             --check false
-      - name: The check fails on the line the change wrote
+          verdict=$?
+          set -e
+          test "$verdict" = "1"
+          grep -q "Vale found 1 alert in 1 file on the lines this change writes" "$GITHUB_STEP_SUMMARY"
+          grep -q "2 further alerts on untouched lines are left out" "$GITHUB_STEP_SUMMARY"
+
+      # The case that made this source necessary: GitHub leaves `patch` out of
+      # the files API for a diff it considers too large, and the fixture's file
+      # list here has none. The pull request's own diff still carries it, so the
+      # verdict must be the same as the one above rather than a whole-file one.
+      - name: A pull request whose file patch the API left out
         run: |
           set -euo pipefail
-          test "${{ steps.alert-edit.outcome }}" = "failure"
-          test "${{ steps.alert-edit.outputs.alerts }}" = "1"
-          test "${{ steps.alert-edit.outputs.ignored }}" = "2"
+          python3 scripts/vale_action.py resolve-files \
+            --files-json fixtures/dirty/files-no-patch.json \
+            --diff fixtures/dirty/change.diff \
+            --lines-out "$RUNNER_TEMP/lines.json" > "$RUNNER_TEMP/list.txt"
+          python3 -c "
+          import json, sys
+          lines = json.load(open(sys.argv[1]))
+          assert lines['whole'] == [], lines
+          assert lines['lines'], lines
+          " "$RUNNER_TEMP/lines.json"
+          set +e
+          vale --no-global --config=fixtures/dirty/.vale.ini --output=JSON \
+            "$(cat "$RUNNER_TEMP/list.txt")" > "$RUNNER_TEMP/raw.json"
+          status=$?
+          set -e
+          set +e
+          python3 scripts/vale_action.py report \
+            --stdout "$RUNNER_TEMP/raw.json" \
+            --status "$status" \
+            --fail-on error \
+            --version "${{ steps.install.outputs.vale-version }}" \
+            --files 1 \
+            --changed-lines "$RUNNER_TEMP/lines.json" \
+            --comment false \
+            --check false
+          verdict=$?
+          set -e
+          test "$verdict" = "1"
+          grep -q "Vale found 1 alert in 1 file on the lines this change writes" "$GITHUB_STEP_SUMMARY"
+          grep -q "2 further alerts on untouched lines are left out" "$GITHUB_STEP_SUMMARY"
 
   fixture-broken:
     name: a linter that could not run does not pass
