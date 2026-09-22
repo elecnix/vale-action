@@ -4,7 +4,8 @@
 The end-to-end proof lives in CI, which runs the composite action against the
 three fixture repositories. These tests pin the decisions that are cheap to get
 wrong and expensive to notice: what counts as a failed run, what `fail-on`
-includes, and that a message cannot escape its table cell.
+includes, which lines of a diff a change is answerable for, and that a message
+cannot escape its table cell.
 """
 
 import argparse, io, json, os, sys, tempfile, unittest, urllib.error
@@ -154,6 +155,258 @@ class ChangedFiles(unittest.TestCase):
         self.assertEqual(va.changed_markdown(files), [])
 
 
+# A real `git diff --no-index` output, with the empty context line spelled as the
+# single space a diff spells it with.
+PATCH = (
+    "diff --git a/docs/guide.md b/docs/guide.md\n"
+    "index 1111111..2222222 100644\n"
+    "--- a/docs/guide.md\n"
+    "+++ b/docs/guide.md\n"
+    "@@ -1,4 +1,5 @@\n"
+    " # Guide\n"
+    " \n"
+    "-The old line.\n"
+    "+The new line, which is very long.\n"
+    "+And a second new line.\n"
+    " Context stays.\n"
+)
+
+
+class PatchParsing(unittest.TestCase):
+    """Which lines of a diff a change is answerable for."""
+
+    def test_the_added_lines_are_the_ones_counted(self):
+        self.assertEqual(va.parse_patch(PATCH), {3, 4})
+
+    def test_the_file_header_is_not_added_text(self):
+        self.assertEqual(va.parse_patch("+++ b/docs/guide.md\n--- a/docs/guide.md\n"), set())
+
+    def test_a_patch_without_hunks_adds_nothing(self):
+        # A rename or a mode change. The pull request did not write prose.
+        self.assertEqual(va.parse_patch("diff --git a/x.md b/y.md\nsimilarity index 100%\n"), set())
+
+    def test_a_new_file_is_added_in_full(self):
+        patch = "@@ -0,0 +1,3 @@\n+One.\n+Two.\n+Three.\n"
+        self.assertEqual(va.parse_patch(patch), {1, 2, 3})
+
+    def test_added_text_that_looks_like_a_file_header_is_added_text(self):
+        patch = "@@ -1,1 +1,2 @@\n # Guide\n+++ b/not-a-header.md\n"
+        self.assertEqual(va.parse_patch(patch), {2})
+
+    def test_a_removed_line_does_not_move_the_new_side(self):
+        patch = "@@ -1,3 +1,2 @@\n keep\n-gone\n+added\n keep\n"
+        self.assertEqual(va.parse_patch(patch), {2})
+
+    def test_a_no_newline_note_is_not_a_line(self):
+        patch = "@@ -1,1 +1,2 @@\n keep\n+added\n\\ No newline at end of file\n"
+        self.assertEqual(va.parse_patch(patch), {2})
+
+    def test_several_hunks_each_count_their_own_lines(self):
+        patch = "@@ -1,1 +1,1 @@\n-one\n+one\n@@ -40,1 +40,2 @@\n forty\n+forty-one\n"
+        self.assertEqual(va.parse_patch(patch), {1, 41})
+
+
+class ChangedLines(unittest.TestCase):
+    def test_only_paths_with_a_patch_are_mapped(self):
+        files = [
+            {"filename": "a.md", "status": "modified", "patch": "@@ -1,1 +1,2 @@\n a\n+b\n"},
+            {"filename": "b.md", "status": "modified"},
+        ]
+        self.assertEqual(va.changed_lines(files), {"a.md": {2}})
+
+    def test_a_path_without_a_patch_is_absent_rather_than_empty(self):
+        # GitHub stops sending the patch once a diff passes its size limit.
+        # "No diff information" must not read as "this change wrote nothing",
+        # or every alert in a large file turns green.
+        self.assertNotIn("b.md", va.changed_lines([{"filename": "b.md", "status": "modified"}]))
+
+
+class Narrowing(unittest.TestCase):
+    """Keeping only the alerts the change is answerable for."""
+
+    def keep(self, alerts, changed):
+        """The lines that survive, and the count left out."""
+        kept, ignored = va.alerts_on_changed_lines(alerts, changed)
+        return [row[1] for row in va.rows(kept)], ignored
+
+    def test_an_alert_on_a_written_line_is_kept(self):
+        self.assertEqual(self.keep({"a.md": [alert(line=7)]}, {"a.md": {7}}), ([7], 0))
+
+    def test_an_inherited_alert_is_counted_but_not_kept(self):
+        alerts = {"a.md": [alert(line=3), alert(line=7), alert(line=9)]}
+        self.assertEqual(self.keep(alerts, {"a.md": {7}}), ([7], 2))
+
+    def test_a_path_with_no_diff_information_keeps_every_alert(self):
+        alerts = {"big.md": [alert(line=1), alert(line=900)]}
+        self.assertEqual(self.keep(alerts, {}), ([1, 900], 0))
+
+    def test_a_path_whose_patch_adds_nothing_keeps_nothing(self):
+        alerts = {"renamed.md": [alert(line=2)]}
+        self.assertEqual(self.keep(alerts, {"renamed.md": set()}), ([], 1))
+
+    def test_a_line_nobody_can_read_is_counted_rather_than_hidden(self):
+        for line in (0, None, "7", True):
+            entry = alert(line=line)
+            self.assertTrue(va.answerable(entry, set()), line)
+
+    def test_a_narrowed_file_that_still_has_alerts_keeps_its_rows(self):
+        kept, _ = va.alerts_on_changed_lines(
+            {"a.md": [alert(line=3)], "b.md": [alert(line=4), alert(line=5)]},
+            {"a.md": {3}, "b.md": {4}},
+        )
+        self.assertEqual(sorted(kept), ["a.md", "b.md"])
+
+
+class ResolveFiles(unittest.TestCase):
+    """Working out what to lint, and which of its lines are new."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.guide = os.path.join(self.root, "docs", "guide.md")
+        os.makedirs(os.path.dirname(self.guide))
+        write(self.guide, "# Guide\n\nIt is very fine.\n")
+        self.files = os.path.join(self.root, "files.json")
+        write(
+            self.files,
+            json.dumps(
+                [
+                    {
+                        "filename": self.guide,
+                        "status": "modified",
+                        "patch": "@@ -1,2 +1,3 @@\n # Guide\n \n+It is very fine.\n",
+                    }
+                ]
+            ),
+        )
+        self.lines = os.path.join(self.root, "lines.json")
+
+    def args(self, **over):
+        base = dict(repo=None, pr=None, token=None, files_json=self.files, lines_out=None)
+        base.update(over)
+        return argparse.Namespace(**base)
+
+    def resolve(self, **over):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = va.cmd_resolve_files(self.args(**over))
+        return code, out.getvalue()
+
+    def test_a_saved_file_list_is_read_instead_of_the_api(self):
+        with mock.patch.object(va, "paginate") as api:
+            code, listed = self.resolve()
+        api.assert_not_called()
+        self.assertEqual(code, 0)
+        self.assertEqual(listed.strip(), self.guide)
+
+    def test_the_lines_out_hold_the_lines_the_change_adds(self):
+        self.resolve(lines_out=self.lines)
+        self.assertEqual(json.loads(va.read(self.lines)), {self.guide: [3]})
+
+    def test_only_the_paths_that_get_linted_are_written_out(self):
+        # A path Vale is not run on has no alerts to narrow, and a path missing
+        # from disk is dropped from the list; neither belongs in the JSON.
+        write(
+            self.files,
+            json.dumps(
+                [
+                    {"filename": self.guide, "status": "modified", "patch": "@@ -1,1 +1,2 @@\n a\n+b\n"},
+                    {"filename": os.path.join(self.root, "gone.md"), "status": "modified", "patch": "@@ -1,1 +1,2 @@\n a\n+b\n"},
+                    {"filename": os.path.join(self.root, "main.go"), "status": "modified", "patch": "@@ -1,1 +1,2 @@\n a\n+b\n"},
+                ]
+            ),
+        )
+        self.resolve(lines_out=self.lines)
+        self.assertEqual(json.loads(va.read(self.lines)), {self.guide: [2]})
+
+    def test_a_file_list_that_is_not_a_list_is_a_mis_invocation(self):
+        write(self.files, json.dumps({"files": []}))
+        with self.assertRaises(ValueError):
+            va.load_files_json(self.files)
+
+    def test_no_source_at_all_is_a_mis_invocation(self):
+        args = self.args(files_json=None)
+        with self.assertRaises(ValueError) as caught:
+            va.cmd_resolve_files(args)
+        self.assertIn("--files-json", str(caught.exception))
+
+
+class Narrowed(unittest.TestCase):
+    """Reading the lines file, and refusing to narrow on a guess."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "lines.json")
+
+    def narrowed(self, path=None):
+        args = argparse.Namespace(changed_lines=self.path if path is None else path)
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            changed = va.narrowed(args)
+        return changed, err.getvalue()
+
+    def refused(self, payload):
+        """A lines file the run must not trust. Returns what it warned about."""
+        write(self.path, payload)
+        changed, err = self.narrowed()
+        self.assertIsNone(changed)
+        return err
+
+    def test_no_flag_means_every_line_counts(self):
+        changed, _ = self.narrowed(path=None)
+        self.assertIsNone(changed)
+
+    def test_the_lines_out_are_read_as_sets(self):
+        write(self.path, json.dumps({"a.md": [3, 9]}))
+        changed, _ = self.narrowed()
+        self.assertEqual(changed, {"a.md": {3, 9}})
+
+    def test_a_missing_lines_file_counts_everything_and_says_so(self):
+        changed, err = self.narrowed(os.path.join(self.tmp.name, "absent.json"))
+        self.assertIsNone(changed)
+        self.assertIn("every alert counts", err)
+
+    def test_an_empty_map_is_not_narrowing(self):
+        # Legitimate: no changed path had a diff GitHub sent. Claiming to have
+        # narrowed while counting everything would misreport the verdict.
+        self.assertNotIn("::warning::", self.refused("{}\n"))
+
+    def test_line_numbers_that_are_not_numbers_are_refused(self):
+        self.assertIn("wrong line numbers", self.refused(json.dumps({"a.md": ["3"]})))
+
+    def test_an_object_that_is_not_a_map_is_refused(self):
+        self.assertIn("expected an object", self.refused(json.dumps([3, 9])))
+
+
+class NarrowedBody(unittest.TestCase):
+    """A narrowed verdict has to say that it is one."""
+
+    def body(self, alerts, failed, ignored, narrow=True):
+        return va.comment_body(alerts, 1, "error", "3.20.0", failed, ignored, narrow)
+
+    def test_the_scope_is_stated(self):
+        body = self.body({"a.md": [alert(line=7)]}, 1, 2)
+        self.assertIn("the lines this change writes", body)
+        self.assertIn("2 further alerts on untouched lines are left out", body)
+
+    def test_a_single_inherited_alert_reads_as_one(self):
+        body = self.body({}, 0, 1)
+        self.assertIn("1 further alert on untouched lines is left out", body)
+        self.assertIn("Nothing on the lines this change writes", body)
+
+    def test_a_whole_file_run_claims_no_narrowing(self):
+        body = self.body({"a.md": [alert()]}, 1, 0, narrow=False)
+        self.assertNotIn("Counted here", body)
+        self.assertIn("every line of every file linted", body)
+
+    def test_the_check_title_says_what_was_counted(self):
+        self.assertEqual(
+            va.verdict_title(0, "error", 2, True), "Clean — nothing on the changed lines"
+        )
+        self.assertIn("on the changed lines", va.verdict_title(3, "error", 2, True))
+        self.assertEqual(va.verdict_title(0, "error", 2, False), "Clean — 2 files linted")
+
+
 OLD = "a" * 40
 NEW = "b" * 40
 
@@ -209,9 +462,19 @@ class SummaryCase(unittest.TestCase):
         self.summary = os.path.join(self.tmp.name, "summary.md")
         os.environ["GITHUB_STEP_SUMMARY"] = self.summary
         self.addCleanup(os.environ.pop, "GITHUB_STEP_SUMMARY", None)
+        self.outputs_path = os.path.join(self.tmp.name, "outputs")
+        os.environ["GITHUB_OUTPUT"] = self.outputs_path
+        self.addCleanup(os.environ.pop, "GITHUB_OUTPUT", None)
 
     def summary_text(self):
         return va.read(self.summary)
+
+    def outputs(self):
+        return dict(
+            line.split("=", 1)
+            for line in va.read(self.outputs_path).splitlines()
+            if "=" in line
+        )
 
 
 class Decoration(SummaryCase):
@@ -283,6 +546,7 @@ class Report(SummaryCase):
             token="t",
             comment=True,
             check=True,
+            changed_lines=None,
         )
         base.update(over)
         return argparse.Namespace(**base)
@@ -292,8 +556,9 @@ class Report(SummaryCase):
             va, "upsert_comment"
         ) as comment, mock.patch.object(va, "create_check") as check, mock.patch(
             "sys.stderr", new_callable=io.StringIO
-        ), mock.patch("sys.stdout", new_callable=io.StringIO):
+        ) as err, mock.patch("sys.stdout", new_callable=io.StringIO):
             code = va.cmd_report(self.args(**over))
+        self.err_text = err.getvalue()
         return code, comment, check
 
     def test_the_head_run_paints_its_verdict(self):
@@ -331,6 +596,42 @@ class Report(SummaryCase):
         self.assertEqual(code, 2)
         self.assertEqual(comment.call_count, 1)
         self.assertEqual(check.call_count, 1)
+
+    def lines(self, mapping):
+        path = os.path.join(self.tmp.name, "lines.json")
+        write(path, json.dumps(mapping))
+        return path
+
+    def test_an_inherited_alert_is_reported_but_does_not_fail_the_check(self):
+        # The issue's repro: one line of a file that is already red, and the
+        # line this change wrote carries nothing. The check goes green, and the
+        # inherited alerts are counted and named rather than silently dropped.
+        write(self.stdout, json.dumps({"a.md": [alert(line=9), alert(line=40)]}))
+        code, comment, check = self.report(head=OLD, changed_lines=self.lines({"a.md": [12]}))
+        self.assertEqual(code, 0)
+        self.assertEqual(check.call_args[0][3], "success")
+        self.assertEqual(self.outputs()["alerts"], "0")
+        self.assertEqual(self.outputs()["ignored"], "2")
+        self.assertIn("left out of the verdict", comment.call_args[0][3])
+
+    def test_an_alert_the_change_wrote_still_fails_the_check(self):
+        write(self.stdout, json.dumps({"a.md": [alert(line=9), alert(line=40)]}))
+        code, comment, check = self.report(head=OLD, changed_lines=self.lines({"a.md": [40]}))
+        self.assertEqual(code, 1)
+        self.assertEqual(check.call_args[0][3], "failure")
+        self.assertEqual(self.outputs()["alerts"], "1")
+
+    def test_a_run_that_did_not_narrow_says_zero_ignored(self):
+        self.report(head=OLD)
+        self.assertEqual(self.outputs()["ignored"], "0")
+
+    def test_an_unreadable_lines_file_counts_everything_and_says_so(self):
+        code, _, _ = self.report(
+            head=OLD, changed_lines=os.path.join(self.tmp.name, "absent.json")
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("every alert counts", self.err_text)
+        self.assertEqual(self.outputs()["alerts"], "1")
 
 
 class Helpers(unittest.TestCase):
