@@ -97,6 +97,103 @@ jobs:
           test "${{ steps.vale.outputs.outcome }}" = "success"
           test "${{ steps.vale.outputs.alerts }}" != "0"
 
+  fixture-changed-lines:
+    name: only the lines this change writes count
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # One run of the action, on the clean fixture, to put `vale` on PATH for
+      # the steps below — and to keep every step in this job one that is
+      # expected to succeed. A step meant to fail leaves a failure annotation
+      # on the check run, and an annotation reading `exit code 1` is
+      # indistinguishable from a broken job to everything downstream of it.
+      # So each case below asserts its own verdict inside the step that
+      # produced it rather than letting the step go red on purpose.
+      - id: install
+        uses: ./
+        with:
+          config: fixtures/clean/.vale.ini
+          files: fixtures/clean/docs
+          sync: false
+          comment: false
+          check: false
+
+      # The baseline the narrowing starts from. Read whole, the dirty fixture
+      # carries six alerts across its two files.
+      - name: Every line of every file linted
+        run: |
+          set -euo pipefail
+          total="$(vale --no-global --config=fixtures/dirty/.vale.ini --output=JSON \
+            fixtures/dirty/docs/guide.md fixtures/dirty/docs/limits.md \
+            | python3 -c 'import json, sys; print(sum(len(a) for a in json.load(sys.stdin).values()))')"
+          test "$total" = "6"
+          echo "The fixture carries $total alerts when its files are read whole."
+
+      # A fixture pull request that touches one line of a file which is already
+      # red. The alerts it inherited are counted, named, and left out of the
+      # verdict, which is the whole point: a gate that goes red over debt the
+      # change did not write is a gate people route around. Vale exits 1 here,
+      # because the file does carry alerts; the verdict is about the line this
+      # change wrote.
+      - name: A pull request whose line the rules say nothing about
+        run: |
+          set -euo pipefail
+          python3 scripts/vale_action.py resolve-files \
+            --files-json fixtures/dirty/files-touching-a-clean-line.json \
+            --lines-out "$RUNNER_TEMP/lines.json" > "$RUNNER_TEMP/list.txt"
+          set +e
+          vale --no-global --config=fixtures/dirty/.vale.ini --output=JSON \
+            "$(cat "$RUNNER_TEMP/list.txt")" > "$RUNNER_TEMP/raw.json"
+          status=$?
+          set -e
+          set +e
+          python3 scripts/vale_action.py report \
+            --stdout "$RUNNER_TEMP/raw.json" \
+            --status "$status" \
+            --fail-on error \
+            --version "${{ steps.install.outputs.vale-version }}" \
+            --files 1 \
+            --changed-lines "$RUNNER_TEMP/lines.json" \
+            --comment false \
+            --check false
+          verdict=$?
+          set -e
+          test "$verdict" = "0"
+          # The wording and the count the reader sees, read back from the step
+          # summary this very step wrote.
+          grep -q "Nothing on the lines this change writes" "$GITHUB_STEP_SUMMARY"
+          grep -q "3 further alerts on untouched lines are left out" "$GITHUB_STEP_SUMMARY"
+
+      # The same shape the other way: the line this fixture pull request writes
+      # is one the rules object to. Narrowing must not become a way for a new
+      # alert to reach main unremarked.
+      - name: A pull request whose line the rules object to
+        run: |
+          set -euo pipefail
+          python3 scripts/vale_action.py resolve-files \
+            --files-json fixtures/dirty/files-touching-an-alert.json \
+            --lines-out "$RUNNER_TEMP/lines.json" > "$RUNNER_TEMP/list.txt"
+          set +e
+          vale --no-global --config=fixtures/dirty/.vale.ini --output=JSON \
+            "$(cat "$RUNNER_TEMP/list.txt")" > "$RUNNER_TEMP/raw.json"
+          status=$?
+          set -e
+          set +e
+          python3 scripts/vale_action.py report \
+            --stdout "$RUNNER_TEMP/raw.json" \
+            --status "$status" \
+            --fail-on error \
+            --version "${{ steps.install.outputs.vale-version }}" \
+            --files 1 \
+            --changed-lines "$RUNNER_TEMP/lines.json" \
+            --comment false \
+            --check false
+          verdict=$?
+          set -e
+          test "$verdict" = "1"
+          grep -q "Vale found 1 alert in 1 file on the lines this change writes" "$GITHUB_STEP_SUMMARY"
+          grep -q "2 further alerts on untouched lines are left out" "$GITHUB_STEP_SUMMARY"
+
   fixture-broken:
     name: a linter that could not run does not pass
     runs-on: ubuntu-latest
