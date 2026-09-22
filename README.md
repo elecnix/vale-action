@@ -92,11 +92,7 @@ it is counted and named in the comment rather than failing the check. That is
 what keeps the gate usable in a repository whose prose was not written under
 it: one line edited in a long-red file gets a verdict about that line.
 
-Nothing is hidden and nothing is guessed. An alert whose line cannot be read
-counts, every alert in a file whose diff GitHub did not send counts — it omits
-the patch once a diff passes a size limit — and a line a change rewrites counts
-as written. Name files with the `files` input and every line of them counts:
-that is the strict mode, and it is what a repository with no debt wants.
+Nothing is hidden and nothing is guessed. The added lines are read from the pull request's own diff, not from the files API: GitHub leaves `patch` out of that response for a diff it considers too large — one 1748-line markdown file was enough — and reading the absence as "no added lines" would have turned that file's verdict back into a whole-file one without saying so. An alert whose line cannot be read counts, a line a change rewrites counts as written, and a file the diff does not carry either (a change set past the diff media type's own limit) counts whole with the comment naming it as counted whole. Name files with the `files` input and every line of them counts: that is the strict mode, and it is what a repository with no debt wants.
 
 **A re-run writes to the job summary alone.** GitHub replays the original event
 when a run is re-run, so the replayed job lints the commit it was queued with,

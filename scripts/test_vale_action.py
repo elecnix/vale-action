@@ -281,9 +281,18 @@ class ResolveFiles(unittest.TestCase):
             ),
         )
         self.lines = os.path.join(self.root, "lines.json")
+        self.diff = os.path.join(self.root, "change.diff")
+        write(
+            self.diff,
+            "diff --git a/%s b/%s\nindex 1111111..2222222 100644\n--- a/%s\n+++ b/%s\n"
+            "@@ -1,2 +1,3 @@\n # Guide\n \n+It is very fine.\n"
+            % ((self.guide, self.guide) * 2),
+        )
 
     def args(self, **over):
-        base = dict(repo=None, pr=None, token=None, files_json=self.files, lines_out=None)
+        base = dict(
+            repo=None, pr=None, token=None, files_json=self.files, lines_out=None, diff=None
+        )
         base.update(over)
         return argparse.Namespace(**base)
 
@@ -299,13 +308,36 @@ class ResolveFiles(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(listed.strip(), self.guide)
 
-    def test_the_lines_out_hold_the_lines_the_change_adds(self):
-        self.resolve(lines_out=self.lines)
-        self.assertEqual(json.loads(va.read(self.lines)), {self.guide: [3]})
+    def test_the_diff_is_the_source_of_the_added_lines(self):
+        # The files API left this patch out; the pull request's own diff still
+        # names the lines, which is the whole point of preferring it.
+        write(self.files, json.dumps([{"filename": self.guide, "status": "modified"}]))
+        self.resolve(lines_out=self.lines, diff=self.diff)
+        self.assertEqual(
+            json.loads(va.read(self.lines)), {"lines": {self.guide: [3]}, "whole": []}
+        )
+
+    def test_a_file_the_diff_does_not_carry_is_named_whole(self):
+        write(self.diff, "")
+        write(self.files, json.dumps([{"filename": self.guide, "status": "modified"}]))
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            self.resolve(lines_out=self.lines, diff=self.diff)
+        self.assertEqual(
+            json.loads(va.read(self.lines)), {"lines": {}, "whole": [self.guide]}
+        )
+        self.assertIn("No diff for", err.getvalue())
+
+    def test_the_files_api_patch_is_the_fallback_the_diff_missed(self):
+        write(self.diff, "diff --git a/other.md b/other.md\n@@ -1,1 +1,2 @@\n a\n+b\n")
+        self.resolve(lines_out=self.lines, diff=self.diff)
+        self.assertEqual(
+            json.loads(va.read(self.lines)), {"lines": {self.guide: [3]}, "whole": []}
+        )
 
     def test_only_the_paths_that_get_linted_are_written_out(self):
         # A path Vale is not run on has no alerts to narrow, and a path missing
         # from disk is dropped from the list; neither belongs in the JSON.
+        write(self.diff, "")
         write(
             self.files,
             json.dumps(
@@ -316,8 +348,11 @@ class ResolveFiles(unittest.TestCase):
                 ]
             ),
         )
-        self.resolve(lines_out=self.lines)
-        self.assertEqual(json.loads(va.read(self.lines)), {self.guide: [2]})
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.resolve(lines_out=self.lines, diff=self.diff)
+        self.assertEqual(
+            json.loads(va.read(self.lines)), {"lines": {self.guide: [2]}, "whole": []}
+        )
 
     def test_a_file_list_that_is_not_a_list_is_a_mis_invocation(self):
         write(self.files, json.dumps({"files": []}))
@@ -342,31 +377,47 @@ class Narrowed(unittest.TestCase):
     def narrowed(self, path=None):
         args = argparse.Namespace(changed_lines=self.path if path is None else path)
         with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
-            changed = va.narrowed(args)
-        return changed, err.getvalue()
+            changed, whole = va.narrowed(args)
+        return (changed, whole), err.getvalue()
 
     def refused(self, payload):
         """A lines file the run must not trust. Returns what it warned about."""
         write(self.path, payload)
-        changed, err = self.narrowed()
+        (changed, _), err = self.narrowed()
         self.assertIsNone(changed)
         return err
 
     def test_no_flag_means_every_line_counts(self):
-        changed, _ = self.narrowed(path=None)
+        (changed, whole), _ = self.narrowed(path=None)
         self.assertIsNone(changed)
+        self.assertEqual(whole, [])
 
     def test_the_lines_out_are_read_as_sets(self):
-        write(self.path, json.dumps({"a.md": [3, 9]}))
-        changed, _ = self.narrowed()
+        write(self.path, json.dumps({"lines": {"a.md": [3, 9]}, "whole": []}))
+        (changed, whole), _ = self.narrowed()
         self.assertEqual(changed, {"a.md": {3, 9}})
+        self.assertEqual(whole, [])
+
+    def test_the_older_flat_shape_is_still_read(self):
+        # A lines file written by the previous version has no whole-file names
+        # in it, which is not an error.
+        write(self.path, json.dumps({"a.md": [3, 9]}))
+        (changed, whole), _ = self.narrowed()
+        self.assertEqual(changed, {"a.md": {3, 9}})
+        self.assertEqual(whole, [])
+
+    def test_files_counted_whole_are_read_and_named(self):
+        write(self.path, json.dumps({"lines": {}, "whole": ["plan.md"]}))
+        (changed, whole), _ = self.narrowed()
+        self.assertEqual(changed, {})
+        self.assertEqual(whole, ["plan.md"])
 
     def test_a_missing_lines_file_counts_everything_and_says_so(self):
-        changed, err = self.narrowed(os.path.join(self.tmp.name, "absent.json"))
+        (changed, _), err = self.narrowed(os.path.join(self.tmp.name, "absent.json"))
         self.assertIsNone(changed)
         self.assertIn("every alert counts", err)
 
-    def test_an_empty_map_is_not_narrowing(self):
+    def test_an_empty_file_is_not_narrowing(self):
         # Legitimate: no changed path had a diff GitHub sent. Claiming to have
         # narrowed while counting everything would misreport the verdict.
         self.assertNotIn("::warning::", self.refused("{}\n"))
@@ -374,8 +425,57 @@ class Narrowed(unittest.TestCase):
     def test_line_numbers_that_are_not_numbers_are_refused(self):
         self.assertIn("wrong line numbers", self.refused(json.dumps({"a.md": ["3"]})))
 
+    def test_file_names_that_are_not_names_are_refused(self):
+        payload = json.dumps({"lines": {}, "whole": [{"path": "a.md"}]})
+        self.assertIn("wrong file names", self.refused(payload))
+
     def test_an_object_that_is_not_a_map_is_refused(self):
         self.assertIn("expected an object", self.refused(json.dumps([3, 9])))
+
+
+class AddedLines(unittest.TestCase):
+    """Reading one unified diff for the whole pull request."""
+
+    def test_each_file_keeps_its_own_lines(self):
+        diff = (
+            "diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -1,1 +1,2 @@\n x\n+y\n"
+            "diff --git a/b.md b/b.md\n--- a/b.md\n+++ b/b.md\n@@ -8,1 +8,2 @@\n x\n+y\n"
+        )
+        self.assertEqual(va.added_lines_by_path(diff), {"a.md": {2}, "b.md": {9}})
+
+    def test_a_deleted_file_has_no_new_side(self):
+        diff = (
+            "diff --git a/gone.md b/gone.md\ndeleted file mode 100644\n--- a/gone.md\n+++ /dev/null\n"
+            "@@ -1,2 +0,0 @@\n-x\n-y\n"
+        )
+        self.assertEqual(va.added_lines_by_path(diff), {})
+
+    def test_a_rename_is_keyed_on_the_new_path(self):
+        diff = (
+            "diff --git a/old.md b/new.md\nsimilarity index 90%\nrename from old.md\n"
+            "rename to new.md\n--- a/old.md\n+++ b/new.md\n@@ -1,1 +1,2 @@\n x\n+y\n"
+        )
+        self.assertEqual(va.added_lines_by_path(diff), {"new.md": {2}})
+
+    def test_a_file_with_no_hunks_adds_nothing(self):
+        # A mode-only change carries no `+++` line, so the header is the only
+        # place its path appears.
+        diff = "diff --git a/a.md b/a.md\nold mode 100644\nnew mode 100755\n"
+        self.assertEqual(va.added_lines_by_path(diff), {"a.md": set()})
+
+    def test_a_quoted_path_with_a_space_is_read_whole(self):
+        diff = (
+            'diff --git "a/docs/my file.md" "b/docs/my file.md"\n'
+            '--- "a/docs/my file.md"\n+++ "b/docs/my file.md"\n@@ -1,1 +1,2 @@\n x\n+y\n'
+        )
+        self.assertEqual(va.added_lines_by_path(diff), {"docs/my file.md": {2}})
+
+    def test_an_empty_diff_names_nothing(self):
+        self.assertEqual(va.added_lines_by_path(""), {})
+
+    def test_the_file_header_is_not_added_text(self):
+        diff = "diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n"
+        self.assertEqual(va.added_lines_by_path(diff), {"a.md": set()})
 
 
 class NarrowedBody(unittest.TestCase):
@@ -601,6 +701,20 @@ class Report(SummaryCase):
         path = os.path.join(self.tmp.name, "lines.json")
         write(path, json.dumps(mapping))
         return path
+
+    def test_a_file_counted_whole_is_named_and_changes_the_title(self):
+        # The case that started this: the files API left PLAN.md's patch out, so
+        # its four inherited alerts came back as "on the changed lines". The
+        # fallback still counts the whole file, and now it says so.
+        write(self.stdout, json.dumps({"plan.md": [alert(line=50)]}))
+        lines = self.lines({"lines": {"a.md": [7]}, "whole": ["plan.md"]})
+        code, comment, check = self.report(head=OLD, changed_lines=lines)
+        self.assertEqual(code, 1)
+        self.assertEqual(check.call_args[0][3], "failure")
+        self.assertIn("counted whole", check.call_args[0][4])
+        self.assertEqual(self.outputs()["alerts"], "1")
+        self.assertIn("GitHub sent no diff", comment.call_args[0][3])
+        self.assertIn("`plan.md`", comment.call_args[0][3])
 
     def test_an_inherited_alert_is_reported_but_does_not_fail_the_check(self):
         # The issue's repro: one line of a file that is already red, and the
