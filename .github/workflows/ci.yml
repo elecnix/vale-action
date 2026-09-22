@@ -97,6 +97,88 @@ jobs:
           test "${{ steps.vale.outputs.outcome }}" = "success"
           test "${{ steps.vale.outputs.alerts }}" != "0"
 
+  fixture-changed-lines:
+    name: only the lines this change writes count
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The control. Read whole, the fixture carries six alerts across two
+      # files, and this run says six. It also leaves `vale` on PATH for the
+      # steps below, which is what installing it inside the action is for.
+      - id: whole
+        continue-on-error: true
+        uses: ./
+        with:
+          config: fixtures/dirty/.vale.ini
+          files: fixtures/dirty/docs
+          sync: false
+          comment: false
+          check: false
+      - name: Every line of every file linted
+        run: test "${{ steps.whole.outputs.alerts }}" = "6"
+
+      # A fixture pull request that touches one line of a file which is already
+      # red. The alerts it inherited are counted, named, and left out of the
+      # verdict, which is the whole point: a gate that goes red over debt the
+      # change did not write is a gate people route around.
+      - name: A pull request whose line the rules say nothing about
+        id: clean-edit
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 scripts/vale_action.py resolve-files \
+            --files-json fixtures/dirty/files-touching-a-clean-line.json \
+            --lines-out "$RUNNER_TEMP/lines.json" > "$RUNNER_TEMP/list.txt"
+          vale --no-global --config=fixtures/dirty/.vale.ini --output=JSON \
+            "$(cat "$RUNNER_TEMP/list.txt")" > "$RUNNER_TEMP/raw.json" || status=$?
+          python3 scripts/vale_action.py report \
+            --stdout "$RUNNER_TEMP/raw.json" \
+            --status "${status:-0}" \
+            --fail-on error \
+            --version "${{ steps.whole.outputs.vale-version }}" \
+            --files 1 \
+            --changed-lines "$RUNNER_TEMP/lines.json" \
+            --comment false \
+            --check false
+      - name: The check passes and the inherited alerts are named
+        run: |
+          set -euo pipefail
+          test "${{ steps.clean-edit.outcome }}" = "success"
+          test "${{ steps.clean-edit.outputs.alerts }}" = "0"
+          test "${{ steps.clean-edit.outputs.ignored }}" = "3"
+          # The wording of that naming is pinned by the unit tests, which can
+          # read the body the report wrote; a step summary belongs to the step
+          # that wrote it and is not readable from the next one.
+
+      # And the same shape the other way: the line this fixture pull request
+      # writes is one the rules object to. Narrowing must not become a way for
+      # a new alert to reach main unremarked.
+      - name: A pull request whose line the rules object to
+        id: alert-edit
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python3 scripts/vale_action.py resolve-files \
+            --files-json fixtures/dirty/files-touching-an-alert.json \
+            --lines-out "$RUNNER_TEMP/lines.json" > "$RUNNER_TEMP/list.txt"
+          vale --no-global --config=fixtures/dirty/.vale.ini --output=JSON \
+            "$(cat "$RUNNER_TEMP/list.txt")" > "$RUNNER_TEMP/raw.json" || status=$?
+          python3 scripts/vale_action.py report \
+            --stdout "$RUNNER_TEMP/raw.json" \
+            --status "${status:-0}" \
+            --fail-on error \
+            --version "${{ steps.whole.outputs.vale-version }}" \
+            --files 1 \
+            --changed-lines "$RUNNER_TEMP/lines.json" \
+            --comment false \
+            --check false
+      - name: The check fails on the line the change wrote
+        run: |
+          set -euo pipefail
+          test "${{ steps.alert-edit.outcome }}" = "failure"
+          test "${{ steps.alert-edit.outputs.alerts }}" = "1"
+          test "${{ steps.alert-edit.outputs.ignored }}" = "2"
+
   fixture-broken:
     name: a linter that could not run does not pass
     runs-on: ubuntu-latest

@@ -1,8 +1,8 @@
 name: 'Vale prose lint'
 description: >-
-  Runs Vale on the prose a pull request changed, posts one pinned comment, and
-  sets a check. Ships no rules of its own — it takes them from the repository
-  it runs in.
+  Runs Vale on the prose a pull request changed, counts only the lines it
+  writes, posts one pinned comment, and sets a check. Ships no rules of its own
+  — it takes them from the repository it runs in.
 author: 'elecnix'
 
 branding:
@@ -31,8 +31,9 @@ inputs:
     default: ''
   files:
     description: >-
-      What to lint, space or newline separated. Leave empty to lint the
-      markdown this pull request changed.
+      What to lint, space or newline separated. Leave empty to lint the markdown
+      this pull request changed, counting only the lines it writes. Naming files
+      here counts every alert in them.
     required: false
     default: ''
   fail-on:
@@ -69,8 +70,13 @@ outputs:
     description: 'success, failure, or error (the linter could not run).'
     value: ${{ steps.report.outputs.outcome }}
   alerts:
-    description: 'Total alerts Vale reported, at every level.'
+    description: 'Alerts counted in the verdict, at every level.'
     value: ${{ steps.report.outputs.alerts }}
+  ignored:
+    description: >-
+      Alerts left out of the verdict because they stand on lines the change did
+      not write. Zero when files were named explicitly.
+    value: ${{ steps.report.outputs.ignored }}
 
 runs:
   using: 'composite'
@@ -123,13 +129,19 @@ runs:
       run: |
         set -euo pipefail
         list="${RUNNER_TEMP:-/tmp}/vale-files.txt"
+        lines=""
         : > "$list"
 
         if [ -n "${FILES// /}" ]; then
           printf '%s\n' $FILES > "$list"
         elif [ -n "$PR" ] && [ -n "$GH_TOKEN" ]; then
+          # The line numbers go to a file because the report step is another
+          # process, and narrowing is what keeps a change that touches one line
+          # of a long-red file from inheriting the whole file's verdict.
+          lines="${RUNNER_TEMP:-/tmp}/vale-changed-lines.json"
           python3 "$ACTION_DIR/scripts/vale_action.py" resolve-files \
-            --repo "$REPO" --pr "$PR" --token "$GH_TOKEN" > "$list"
+            --repo "$REPO" --pr "$PR" --token "$GH_TOKEN" \
+            --lines-out "$lines" > "$list"
         else
           # Not a pull request and nothing named: walk the tree. --glob is a
           # directory-walk filter, so it works here and only here — pass it
@@ -142,6 +154,7 @@ runs:
         count="$(grep -cve '^$' "$list" || true)"
         echo "list=$list" >> "$GITHUB_OUTPUT"
         echo "count=$count" >> "$GITHUB_OUTPUT"
+        echo "lines=$lines" >> "$GITHUB_OUTPUT"
         echo "Linting $count path(s)."
 
     - name: Sync Vale packages
@@ -226,8 +239,12 @@ runs:
         PR: ${{ github.event.pull_request.number }}
         SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         GH_TOKEN: ${{ inputs.token }}
+        LINES: ${{ steps.files.outputs.lines }}
       run: |
         set -euo pipefail
+        # --changed-lines is passed only when the files step worked out which
+        # lines this change writes. Naming files explicitly means counting all
+        # of them, which is what an empty $LINES asks for.
         python3 "$ACTION_DIR/scripts/vale_action.py" report \
           --stdout "${RUNNER_TEMP:-/tmp}/vale-out.json" \
           --stderr "${RUNNER_TEMP:-/tmp}/vale-err.txt" \
@@ -239,5 +256,6 @@ runs:
           ${PR:+--pr "$PR"} \
           --sha "$SHA" \
           --token "$GH_TOKEN" \
+          ${LINES:+--changed-lines "$LINES"} \
           --comment "${{ inputs.comment }}" \
           --check "${{ inputs.check }}"

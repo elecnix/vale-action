@@ -29,6 +29,15 @@ was queued with, writes to the job summary and nothing else.
 comment and the check run are skipped with a warning. Failing the whole action
 because it could not decorate the pull request would punish the safest config.
 
+**Only the lines a change writes count.** Vale has to read a file whole — a
+sentence is judged in its context, and a style can only see a paragraph if it
+sees all of it — so a changed file is linted whole and the alerts are narrowed
+afterwards to the lines this pull request adds or rewrites. An alert on a line
+the change did not write is debt the pull request inherited, and a gate that
+goes red over inherited debt is one people route around. Those alerts are
+reported as a count, never as a verdict. Nothing is hidden: a file whose diff
+GitHub did not send, and an alert whose line cannot be read, count in full.
+
 Exit codes:
 
     0  clean, or every alert is below `fail-on`
@@ -41,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -170,9 +180,100 @@ def changed_markdown(files: list[dict]) -> list[str]:
     )
 
 
+# A hunk header: `@@ -old_start,old_count +new_start,new_count @@`, where
+# either count is omitted when it is 1. Only the new side matters here.
+HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def parse_patch(patch: str) -> set[int]:
+    """The line numbers a unified diff adds or rewrites, on the new side.
+
+    The added lines are counted rather than the hunk's new-side span on
+    purpose: a span carries three lines of context on each side, and an alert
+    standing in that context is one the change did not write.
+
+    A rewritten line is added on the new side, which is what makes the verdict
+    agree with `git blame`: the change is answerable for the whole line."""
+    added: set[int] = set()
+    line: int | None = None
+    for raw in patch.splitlines():
+        header = HUNK.match(raw)
+        if header:
+            line = int(header.group(1))
+            continue
+        if line is None:
+            # `diff --git`, `index`, `---`, `+++`: the file header, and the
+            # only place a `+++` is a filename rather than text this change
+            # adds. Inside a hunk it is added text, which is why the header
+            # check comes first and stops at the first hunk.
+            continue
+        if raw.startswith("+"):
+            added.add(line)
+            line += 1
+        elif raw.startswith("-"):
+            continue  # gone from the new side
+        elif raw.startswith("\\"):
+            continue  # `\ No newline at end of file`, a note about the line above
+        else:
+            line += 1  # context
+    return added
+
+
+def changed_lines(files: list[dict]) -> dict[str, set[int]]:
+    """The added line numbers per path, out of the pull request's file list.
+
+    A path the API sent without a patch is left out instead of mapped to an
+    empty set. GitHub omits the patch once a diff passes its size limit, and
+    "no diff information" has to read as "count every alert": mapping it to
+    nothing would turn every alert in a large file green."""
+    out: dict[str, set[int]] = {}
+    for entry in files:
+        name = entry.get("filename")
+        patch = entry.get("patch")
+        if isinstance(name, str) and isinstance(patch, str):
+            out[name] = parse_patch(patch)
+    return out
+
+
+def load_files_json(path: str) -> list[dict]:
+    """A pull request file list already saved to disk, as `gh api` prints it.
+
+    This is what lets a contributor reproduce the narrowed verdict on a laptop
+    without a token, and what lets CI prove the narrowing without a live pull
+    request."""
+    parsed = json.loads(read(path) or "null")
+    if not isinstance(parsed, list):
+        raise ValueError(
+            f"{path} holds {type(parsed).__name__}; expected the pull request's file list"
+        )
+    return parsed
+
+
+def write_lines(path: str, lines: dict[str, set[int]]) -> None:
+    """Hand the added lines to the report step, which runs in another process
+    and has no way to see what this one read."""
+    payload = {name: sorted(numbers) for name, numbers in sorted(lines.items())}
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, sort_keys=True)
+        handle.write("\n")
+
+
 def cmd_resolve_files(args: argparse.Namespace) -> int:
-    files = paginate(f"/repos/{args.repo}/pulls/{args.pr}/files", args.token)
+    if args.files_json:
+        files = load_files_json(args.files_json)
+    elif args.repo and args.pr and args.token:
+        files = paginate(f"/repos/{args.repo}/pulls/{args.pr}/files", args.token)
+    else:
+        raise ValueError(
+            "resolve-files needs --files-json, or --repo, --pr and --token together"
+        )
     paths = [p for p in changed_markdown(files) if os.path.exists(p)]
+    if args.lines_out:
+        linted = set(paths)
+        write_lines(
+            args.lines_out,
+            {name: lines for name, lines in changed_lines(files).items() if name in linted},
+        )
     print("\n".join(paths))
     return 0
 
@@ -249,6 +350,83 @@ def failing(tally: dict[str, int], fail_on: str) -> int:
     return sum(tally[level] for level in LEVELS[LEVELS.index(fail_on) :])
 
 
+# --------------------------------------------------------------------------
+# Narrowing the alerts to the lines this change writes
+# --------------------------------------------------------------------------
+
+
+def answerable(entry: dict, lines: set[int]) -> bool:
+    """Is this alert standing on a line the change wrote?
+
+    A line that cannot be read answers yes. An alert nobody can place is not
+    one to drop on a guess."""
+    line = entry.get("Line")
+    if not isinstance(line, int) or isinstance(line, bool) or line <= 0:
+        return True
+    return line in lines
+
+
+def alerts_on_changed_lines(alerts: dict, changed: dict[str, set[int]]) -> tuple[dict, int]:
+    """Keep the alerts the change is answerable for, and count the rest.
+
+    A path with no diff information keeps every alert it has: that is the
+    reading that cannot pass anything by accident."""
+    kept: dict = {}
+    ignored = 0
+    for path, entries in alerts.items():
+        lines = changed.get(path)
+        if lines is None:
+            kept[path] = list(entries)
+            continue
+        mine = [entry for entry in entries if answerable(entry, lines)]
+        ignored += len(entries) - len(mine)
+        if mine:
+            kept[path] = mine
+    return kept, ignored
+
+
+def load_changed_lines(path: str) -> dict[str, set[int]] | None:
+    """The added lines out of what `resolve-files --lines-out` wrote, or None
+    when there is nothing to narrow with."""
+    raw = read(path)
+    if not raw.strip():
+        return None
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{path} holds {type(parsed).__name__}; expected an object")
+    out: dict[str, set[int]] = {}
+    for name, numbers in parsed.items():
+        if not isinstance(numbers, list) or not all(
+            isinstance(n, int) and not isinstance(n, bool) for n in numbers
+        ):
+            raise ValueError(f"{path} holds the wrong line numbers for {name!r}")
+        out[name] = set(numbers)
+    return out
+
+
+def narrowed(args: argparse.Namespace) -> dict[str, set[int]] | None:
+    """The lines this change writes, or None when every line of the linted
+    files counts.
+
+    A flag that is set but unreadable is not permission to hide alerts: the run
+    reports everything it found and says why."""
+    if not args.changed_lines:
+        return None
+    try:
+        changed = load_changed_lines(args.changed_lines)
+    except ValueError as exc:
+        warn(f"Could not read the changed lines ({exc}); every alert counts this run.")
+        return None
+    if changed is None:
+        warn(f"{args.changed_lines} holds no changed lines; every alert counts this run.")
+        return None
+    if not changed:
+        # No path had a diff GitHub sent. That is not narrowing either: every
+        # line counts, and the verdict must not claim otherwise.
+        return None
+    return changed
+
+
 def rows(alerts: dict) -> list[tuple]:
     out = []
     for path in sorted(alerts):
@@ -279,20 +457,60 @@ def escape(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ").replace("::", ":\u200b:").strip()
 
 
+def verdict_title(failed: int, fail_on: str, files_linted: int, narrow: bool) -> str:
+    """The one line the check list shows, which has to say what was counted."""
+    if not narrow:
+        return (
+            f"{plural(failed, 'alert')} at or above {fail_on}"
+            if failed
+            else f"Clean — {plural(files_linted, 'file')} linted"
+        )
+    return (
+        f"{plural(failed, 'alert')} on the changed lines, at or above {fail_on}"
+        if failed
+        else "Clean — nothing on the changed lines"
+    )
+
+
+def scope_note(ignored: int, narrow: bool) -> str:
+    """What was counted, said plainly, because a narrowed verdict that reads
+    like a whole-file one is the confusion this action exists to remove."""
+    if not narrow:
+        return ""
+    counted = "Counted here: the lines this change writes."
+    if not ignored:
+        return counted
+    return (
+        f"Counted here: the lines this change writes. "
+        f"{plural(ignored, 'further alert')} on untouched lines "
+        f"{'is' if ignored == 1 else 'are'} left out of the verdict."
+    )
+
+
 def comment_body(
-    alerts: dict, files_linted: int, fail_on: str, version: str, failed: int
+    alerts: dict,
+    files_linted: int,
+    fail_on: str,
+    version: str,
+    failed: int,
+    ignored: int = 0,
+    narrow: bool = False,
 ) -> str:
     tally = counts_by_level(alerts)
     total = sum(tally.values())
     lines = [MARKER, ""]
 
     if total == 0:
-        lines.append(f"### Vale is clean — {plural(files_linted, 'file')} linted")
+        if narrow:
+            lines.append("### Nothing on the lines this change writes")
+        else:
+            lines.append(f"### Vale is clean — {plural(files_linted, 'file')} linted")
     else:
         verdict = "fails" if failed else "passes"
+        where = " on the lines this change writes" if narrow else ""
         lines.append(
             f"### Vale found {plural(total, 'alert')} in "
-            f"{plural(len(alerts), 'file')} — this check {verdict}"
+            f"{plural(len(alerts), 'file')}{where} — this check {verdict}"
         )
         lines.append("")
         lines.append(
@@ -311,8 +529,17 @@ def comment_body(
             lines.append("")
             lines.append(f"…and {len(table) - MAX_ROWS} more. Run Vale locally to see them all.")
 
+    note = scope_note(ignored, narrow)
+    if note:
+        lines.append("")
+        lines.append(note)
+
+    scope = "only the lines a change writes" if narrow else "every line of every file linted"
     lines.append("")
-    lines.append(f"<sub>vale {version} · elecnix/vale-action · rules come from this repository</sub>")
+    lines.append(
+        f"<sub>vale {version} · elecnix/vale-action · {scope} · "
+        "rules come from this repository</sub>"
+    )
     return "\n".join(lines)
 
 
@@ -436,18 +663,25 @@ def cmd_report(args: argparse.Namespace) -> int:
         emit_output("outcome", "error")
         return 2
 
+    # Narrow to the lines this change writes, before anything is counted. What
+    # is left out is still named, so a reader never mistakes a narrowed pass for
+    # a clean file.
+    changed = narrowed(args)
+    ignored = 0
+    if changed is not None:
+        alerts, ignored = alerts_on_changed_lines(alerts, changed)
+
     tally = counts_by_level(alerts)
     failed = failing(tally, args.fail_on)
-    body = comment_body(alerts, args.files, args.fail_on, args.version, failed)
-    conclusion = "failure" if failed else "success"
-    title = (
-        f"{plural(failed, 'alert')} at or above {args.fail_on}"
-        if failed
-        else f"Clean — {plural(args.files, 'file')} linted"
+    body = comment_body(
+        alerts, args.files, args.fail_on, args.version, failed, ignored, changed is not None
     )
+    conclusion = "failure" if failed else "success"
+    title = verdict_title(failed, args.fail_on, args.files, changed is not None)
     decorate(args, body, conclusion, title, head)
     emit_output("outcome", "failure" if failed else "success")
     emit_output("alerts", str(sum(tally.values())))
+    emit_output("ignored", str(ignored))
     return 1 if failed else 0
 
 
@@ -506,9 +740,19 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     resolve = sub.add_parser("resolve-files", help="list the markdown this PR changed")
-    resolve.add_argument("--repo", required=True)
-    resolve.add_argument("--pr", required=True, type=int)
-    resolve.add_argument("--token", required=True)
+    resolve.add_argument("--repo", help="owner/name to read the pull request from")
+    resolve.add_argument("--pr", type=int)
+    resolve.add_argument("--token")
+    resolve.add_argument(
+        "--files-json",
+        dest="files_json",
+        help="a file list already on disk, instead of reading the API",
+    )
+    resolve.add_argument(
+        "--lines-out",
+        dest="lines_out",
+        help="where to write the lines this change adds, as JSON",
+    )
     resolve.set_defaults(func=cmd_resolve_files)
 
     report = sub.add_parser("report", help="turn a vale run into a verdict")
@@ -518,6 +762,12 @@ def main(argv: list[str] | None = None) -> int:
     report.add_argument("--fail-on", default="error", dest="fail_on")
     report.add_argument("--version", default="unknown")
     report.add_argument("--files", type=int, default=0, help="how many files were linted")
+    report.add_argument(
+        "--changed-lines",
+        dest="changed_lines",
+        default=None,
+        help="lines this change writes, from resolve-files --lines-out",
+    )
     report.add_argument("--repo", default=None)
     report.add_argument("--pr", type=int, default=None)
     report.add_argument("--sha", default=None, help="the commit this run checked out")

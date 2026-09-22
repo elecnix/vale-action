@@ -1,0 +1,9 @@
+[
+  {
+    "filename": "fixtures/dirty/docs/guide.md",
+    "status": "modified",
+    "additions": 1,
+    "deletions": 0,
+    "patch": "@@ -5,3 +5,4 @@ The parser is very fast and really quite good at reading a header.\n ## Limits\n \n It basically rejects a header longer than one kilobyte.\n+A header past that limit is refused outright.\n"
+  }
+]

@@ -60,7 +60,7 @@ off:
 | `config` | *(empty)* | Path to your `.vale.ini`. Empty lets Vale find it by walking up from the linted files, which is the normal case. |
 | `sync` | `true` | Run `vale sync` first, to fetch what a `Packages =` line pins. Set `false` when the repository commits its styles. |
 | `styles` | *(empty)* | An extra styles directory to add on top of the resolved `StylesPath`, for rules that live outside the pinned pack. |
-| `files` | *(empty)* | What to lint, space or newline separated. Empty means the markdown this pull request changed. |
+| `files` | *(empty)* | What to lint, space or newline separated. Empty means the markdown this pull request changed, counting only the lines it writes. Naming files here counts every alert in them. |
 | `fail-on` | `error` | The alert level that fails the check: `suggestion`, `warning`, or `error`. |
 | `comment` | `true` | Post the pinned pull-request comment. The check is set either way. |
 | `check` | `true` | Create the `vale` check run. |
@@ -73,7 +73,8 @@ off:
 | --- | --- |
 | `vale-version` | The Vale version that produced the verdict, so a reader can explain a verdict that changed. |
 | `outcome` | `success`, `failure`, or `error` — the last meaning the linter could not run. |
-| `alerts` | Total alerts Vale reported, at every level. |
+| `alerts` | Alerts counted in the verdict, at every level. The ones left out of it are in `ignored`. |
+| `ignored` | Alerts left out of the verdict because they stand on lines the change did not write. Zero when files were named explicitly. |
 
 ## What it does on a pull request
 
@@ -82,6 +83,20 @@ and rewrites it. A push never adds a second one.
 
 **A check named `vale`.** Green when nothing reached `fail-on`, red when
 something did, and red with the words *could not run* when Vale itself failed.
+
+**Only the lines a change writes count.** Vale has to read a file whole — a
+sentence is judged in its context — so a changed file is linted whole and the
+alerts are narrowed afterwards to the lines this pull request adds or rewrites.
+An alert standing on a line the change did not write is debt it inherited, and
+it is counted and named in the comment rather than failing the check. That is
+what keeps the gate usable in a repository whose prose was not written under
+it: one line edited in a long-red file gets a verdict about that line.
+
+Nothing is hidden and nothing is guessed. An alert whose line cannot be read
+counts, every alert in a file whose diff GitHub did not send counts — it omits
+the patch once a diff passes a size limit — and a line a change rewrites counts
+as written. Name files with the `files` input and every line of them counts:
+that is the strict mode, and it is what a repository with no debt wants.
 
 **A re-run writes to the job summary alone.** GitHub replays the original event
 when a run is re-run, so the replayed job lints the commit it was queued with,
@@ -134,6 +149,10 @@ in one file fail to load.
 **Deleted files are dropped.** Vale reports a missing path as a failed run, so a
 pull request that only removes prose stays green.
 
+**A rewritten line is a written line.** The narrowing follows the added lines of
+the diff, so a line changed in place is the change's to answer for. A line it
+did not touch is not, however close to the change it sits.
+
 ## Running it locally
 
 The point of the no-rules design is that this reproduces the check exactly:
@@ -144,15 +163,36 @@ vale sync                  # only when your .vale.ini pins packages
 vale --no-global $(git diff --name-only origin/main... -- '*.md')
 ```
 
+Narrowing to the changed lines is two more commands, the ones the action runs.
+`resolve-files` reads the pull request's file list from the API, or from a copy
+of it saved to disk:
+
+```sh
+gh api repos/OWNER/REPO/pulls/NUMBER/files > /tmp/files.json
+python3 scripts/vale_action.py resolve-files \
+  --files-json /tmp/files.json --lines-out /tmp/lines.json > /tmp/list.txt
+
+vale --no-global --output=JSON $(cat /tmp/list.txt) > /tmp/alerts.json
+status=$?
+python3 scripts/vale_action.py report \
+  --stdout /tmp/alerts.json --status "$status" \
+  --files "$(wc -l < /tmp/list.txt)" --changed-lines /tmp/lines.json
+```
+
+That last command prints the comment the check would post and exits the way the
+check does: 0, 1 for alerts at or above `fail-on`, 2 when Vale could not run.
+
 `--no-global` matters as much on a laptop as on a runner. Drop it and your own
 `~/.vale.ini` joins the rule set, and the answer stops matching CI.
 
 ## Fixtures
 
-`fixtures/` holds three small repositories that CI runs the action against on
-every change: one whose prose is clean, one whose prose is not, and one whose
-configuration is broken. They pin the three verdicts — green, red, and *could
-not run*.
+`fixtures/` holds small repositories that CI runs the action against on every
+change: one whose prose is clean, one whose prose is not, and one whose
+configuration is broken. They pin the verdicts — green, red, and *could not
+run*. The dirty one also carries two saved file lists, which is how CI proves
+the narrowing without a live pull request: one change touches a line the rules
+object to, the other touches a line they say nothing about.
 
 ## License
 
