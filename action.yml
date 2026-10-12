@@ -1,8 +1,5 @@
 name: 'Vale prose lint'
-description: >-
-  Runs Vale on the prose a pull request changed, counts only the lines it
-  writes, posts one pinned comment, and sets a check. Ships no rules of its own
-  — it takes them from the repository it runs in.
+description: 'Run Vale on the prose a pull request changed, counting only the lines it writes. Rules come from your repository.'
 author: 'elecnix'
 
 branding:
