@@ -1,8 +1,9 @@
 name: ci
 
-# Three things are proved here on every change: the verdict logic in unit
-# tests, the composite action end to end against the fixture repositories, and
-# that no name which must stay private reached this repository.
+# Four things are proved here on every change: the verdict logic in unit tests,
+# the composite action end to end against the fixture repositories, that no name
+# which must stay private reached this repository, and that the metadata still
+# passes the rules the Marketplace enforces when a release is published.
 on:
   pull_request:
   push:
@@ -24,6 +25,15 @@ jobs:
         with:
           fetch-depth: 0   # the author-address check reads the whole history
       - run: ./scripts/scrub.sh .
+
+  metadata:
+    name: marketplace metadata is publishable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # GitHub runs these same rules on the release page and nowhere else, so a
+      # field that breaks one sits here until someone tries to publish.
+      - run: python3 scripts/check_marketplace.py
 
   unit:
     name: verdict logic
