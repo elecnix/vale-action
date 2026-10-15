@@ -21,7 +21,7 @@ jobs:
     name: no private names
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0   # the author-address check reads the whole history
       - run: ./scripts/scrub.sh .
@@ -30,7 +30,7 @@ jobs:
     name: marketplace metadata is publishable
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # GitHub runs these same rules on the release page and nowhere else, so a
       # field that breaks one sits here until someone tries to publish.
       - run: python3 scripts/check_marketplace.py
@@ -39,8 +39,8 @@ jobs:
     name: verdict logic
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.x'
       - run: python3 scripts/test_vale_action.py
@@ -49,7 +49,7 @@ jobs:
     name: clean prose passes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: vale
         uses: ./
         with:
@@ -69,7 +69,7 @@ jobs:
     name: bad prose fails
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: vale
         continue-on-error: true
         uses: ./
@@ -90,7 +90,7 @@ jobs:
     name: bad prose passes under a higher fail-on
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The same alerts, demoted below the bar. This pins `fail-on` as the
       # only thing separating this run from the red one above.
       - id: vale
@@ -111,7 +111,7 @@ jobs:
     name: only the lines this change writes count
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # One run of the action, on the clean fixture, to put `vale` on PATH for
       # the steps below — and to keep every step in this job one that is
       # expected to succeed. A step meant to fail leaves a failure annotation
@@ -249,7 +249,7 @@ jobs:
     name: a linter that could not run does not pass
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: vale
         continue-on-error: true
         uses: ./
@@ -269,7 +269,7 @@ jobs:
     name: an extra styles directory is added
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The clean fixture's prose is clean only against the clean fixture's
       # rules. Inject one more rule and it has to go red.
       - id: vale
